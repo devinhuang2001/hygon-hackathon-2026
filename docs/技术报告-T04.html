@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>"国芯国模"黑客松 · 技术报告 · T04 语音模型适配</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  body { font-family: "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; font-size: 10.5pt; line-height: 1.7; color: #1f2329; }
+  h1 { font-size: 19pt; text-align: center; margin: 0 0 4mm; }
+  .sub { text-align: center; color: #646a73; font-size: 9.5pt; margin-bottom: 8mm; }
+  h2 { font-size: 13pt; margin: 7mm 0 2mm; padding-left: 3mm; border-left: 3pt solid #3370ff; }
+  h3 { font-size: 11pt; margin: 4mm 0 1.5mm; color: #245bdb; }
+  p { margin: 1.5mm 0; text-align: justify; }
+  table { border-collapse: collapse; width: 100%; margin: 2mm 0 3mm; font-size: 9pt; }
+  th, td { border: 0.5pt solid #c9cdd4; padding: 1.2mm 2mm; }
+  th { background: #f2f3f5; text-align: left; }
+  code, pre { font-family: Consolas, "Courier New", monospace; background: #f5f6f7; }
+  pre { padding: 2mm 3mm; font-size: 8.5pt; line-height: 1.45; white-space: pre-wrap; border-radius: 2pt; }
+  .note { background: #f0f4ff; border-left: 3pt solid #3370ff; padding: 2mm 3mm; margin: 2mm 0; font-size: 9.5pt; }
+  .warn { background: #fff7ec; border-left: 3pt solid #ff8800; padding: 2mm 3mm; margin: 2mm 0; font-size: 9.5pt; }
+  ul { margin: 1.5mm 0 1.5mm 5mm; padding: 0; }
+  li { margin: 0.8mm 0; }
+  .kv td:first-child { width: 30%; color: #646a73; }
+  footer { margin-top: 8mm; font-size: 8.5pt; color: #8f959e; text-align: center; }
+</style>
+</head>
+<body>
+
+<h1>“国芯国模”黑客松 · 技术报告</h1>
+<div class="sub">赛题 T04 语音模型适配 ｜ 卡型 K100-AI（K500SM_AI 64GB 单卡）｜ vLLM 0.21.0 ｜ bf16</div>
+
+<h2>1. 简介</h2>
+<p>本报告记录 <b>Qwen3-ASR-1.7B</b>、<b>Qwen3-ASR-0.6B</b>、<b>Qwen3-ForcedAligner-0.6B</b> 三个语音模型在
+海光 K100-AI（实测实例 K500SM_AI 64GB 单卡）上的适配与优化结果，覆盖语音识别（转写）与强制对齐（词级时间戳）
+两类任务。</p>
+<p>核心结论：三个模型均在该卡上跑通并给出可复现的实测数据，<b>未修改任何模型代码、未升级任何软件包</b>，
+全部复用镜像自带的 HCU 版 torch / triton / vllm-hcu 与 DTK；适配工作集中在运行时装配与三个启动参数的确定上。</p>
+<p>关键实测：单并发下 Qwen3-ASR-1.7B 达 21.97 倍实时、32 并发达 208 倍实时；0.6B 分别为 37 倍与 225 倍实时；
+强制对齐模型对 7.18 s 英文音频输出 16 个词级时间戳、对 5.62 s 中文音频输出 13 个逐字时间戳，均严格单调且落在音频时长内。</p>
+<div class="note">提交仓库：<b>https://github.com/devinhuang2001/hygon-hackathon-2026</b><br>
+仓库内 <code>submissions/01</code>、<code>02</code>、<code>08</code> 三个目录即为本报告对应的完整提交包（含脚本与原始证据）。</div>
+
+<h2>2. 验证环境</h2>
+<table class="kv">
+<tr><td>镜像</td><td><code>harbor.sourcefind.cn:5443/hcu/admin/base/vllm:0.21.0-ubuntu22.04-dtk2604-py3.10</code></td></tr>
+<tr><td>卡型</td><td>K500SM_AI 64 GB × 1（120 SM），按赛事口径计入 K100-AI</td></tr>
+<tr><td>节点</td><td>SCNet 超算互联网 Notebook，Hygon C86 7185 32C / 503 GB RAM</td></tr>
+<tr><td>Python / torch</td><td>3.10.21 / <code>2.10.0+das.opt1.dtk2604.2608141812</code>（HIP 6.3.26113）</td></tr>
+<tr><td>triton / vllm</td><td><code>3.6.0+das185.dtk2604</code> / <code>0.21.0+das.dtk2604</code>（vllm-hcu <code>0.21.0+das</code>）</td></tr>
+<tr><td>transformers</td><td>5.5.0</td></tr>
+<tr><td>精度 / 并行</td><td>bf16 / 单卡（TP=1, PP=1）</td></tr>
+<tr><td>服务端口</td><td>8000（OpenAI 兼容接口）</td></tr>
+</table>
+<p>说明：该实例无容器运行时（无 docker / podman），镜像层经 harbor 匿名拉取后在实例内解包为 rootfs（24 层 /
+7.87 GB → 解包 31 GB），运行时以宿主内核 + 镜像内 DTK/Python 包执行，驱动 <code>/opt/hyhal</code> 由平台注入——
+与容器内的实际形态一致（DTK 与包来自镜像，驱动来自宿主）。</p>
+
+<h2>3. 适配优化方案</h2>
+
+<h3>3.1 基础镜像与软件包</h3>
+<p>使用 <code>docker_images.md</code> 中 vLLM 0.21 的推荐镜像；<b>未升级任何软件包</b>，<code>requirements-extra.txt</code> 为空。
+镜像自带 torch / triton / vllm / vllm-hcu / flash_attn / aiter / lmslim 全套海光版本。</p>
+
+<h3>3.2 三个必须处理的运行时装配</h3>
+<table>
+<tr><th style="width:32%">现象</th><th style="width:30%">根因</th><th>处理</th></tr>
+<tr><td><code>ModuleNotFoundError: vllm...fused_moe.modular_kernel</code></td>
+<td>镜像内 <code>vllm_hcu</code> 用<b>绝对</b>符号链接覆盖 vllm 的部分模块，解包后指向 <code>/usr/local/...</code> 失效</td>
+<td>把指向镜像绝对路径的链接改指向 <code>$ROOTFS</code> 同一路径（<code>run.sh</code> 内幂等执行）</td></tr>
+<tr><td><code>get hyhal driver version error</code> / hcusmi 初始化失败</td>
+<td>镜像不含 <code>/opt/hyhal</code>（驱动用户态由平台注入，等同 nvidia-container-toolkit）</td>
+<td>补入宿主 <code>/opt/hyhal</code>，并放进 <code>LD_LIBRARY_PATH</code></td></tr>
+<tr><td><code>HSACOError: File operation failed: ... .amdgcn</code>，表现为 EngineCore 启动失败</td>
+<td>triton 的 HCU 后端从 <code>ROCM_PATH</code> 下找 <code>aillvm</code>；宿主 DTK 无该目录，回退到 <code>llvm</code> 导致编译产物缺失</td>
+<td><code>ROCM_PATH</code> 指向<b>镜像内</b> DTK（含 <code>aillvm</code>），驱动仍用宿主 <code>/opt/hyhal</code></td></tr>
+</table>
+
+<h3>3.3 强制对齐模型的三项专属设置</h3>
+<p>Qwen3-ForcedAligner-0.6B 的 <code>config.json</code> 中标称 <code>architectures=Qwen3ASRForConditionalGeneration</code>，
+但实际是 token classification 头。三项设置缺一不可，否则分别报「按生成模型加载失败」「走生成路径」「max_model_len 校验失败」：</p>
+<pre>--runner pooling
+--hf-overrides '{"architectures":["Qwen3ASRForcedAlignerForTokenClassification"]}'
+--max-model-len 8192        # 模型 max_position_embeddings 上限，写 32768 直接报错</pre>
+<p>官方用 <code>qwen_asr</code> 包的 <code>Qwen3ForcedAligner.align()</code>；本环境无该包（PyPI 镜像亦无），
+故按官方源码 <code>qwen_asr/inference/qwen3_forced_aligner.py</code> 逐段复刻算法到 vLLM pooling 路径：</p>
+<ul>
+<li>输入构造：<code>&lt;|audio_start|&gt;&lt;|audio_pad|&gt;&lt;|audio_end|&gt;</code> + <code>"&lt;timestamp&gt;&lt;timestamp&gt;".join(words) + "&lt;timestamp&gt;&lt;timestamp&gt;"</code></li>
+<li>取 <code>timestamp_token_id=151705</code> 位置的分类 argmax，<code>时间(ms) = 索引 × timestamp_segment_time</code>（本模型 80 ms/格）</li>
+<li>用最长递增子序列平滑异常跳变后，按 (start, end) 成对切给每个词；中文按官方 CJK 规则逐字切分</li>
+</ul>
+
+<h3>3.4 升级步骤</h3>
+<pre>解包镜像 → bash run.sh（装配环境 + 起服务 + 轮询 /health）→ bash env_check.sh → bash smoke.sh → bash bench.sh</pre>
+
+<h2>4. 服务启动脚本</h2>
+<h3>4.1 语音识别（两个 ASR 模型，仅模型路径不同）</h3>
+<pre>python3 -m vllm.entrypoints.openai.api_server \
+  --model /root/hygon/models/asr_orig \
+  --served-model-name qwen3-asr-1.7b \
+  --trust-remote-code --dtype bfloat16 \
+  --max-model-len 32768 --gpu-memory-utilization 0.90 \
+  --host 127.0.0.1 --port 8000</pre>
+<p>参数理由：<code>--dtype bfloat16</code> 与官方权重一致、匹配镜像内 flash-attn 路径；<code>--max-model-len 32768</code>
+为模型原生上下文（单条音频远小于此，KV cache 按实际长度分配）；<code>--gpu-memory-utilization 0.90</code> 单卡独占，
+留 10% 给 DTK 运行时与编译缓存，实测稳态显存 60.2 GB / 64 GB；未开 <code>--enforce-eager</code>，走默认
+torch.compile + CUDA Graph（首次启动一次性编译，缓存可复用）。</p>
+
+<h3>4.2 强制对齐</h3>
+<pre>python3 -m vllm.entrypoints.openai.api_server \
+  --model /root/hygon/models/fa06 \
+  --served-model-name qwen3-forcedaligner-0.6b \
+  --runner pooling \
+  --hf-overrides '{"architectures":["Qwen3ASRForcedAlignerForTokenClassification"]}' \
+  --trust-remote-code --dtype bfloat16 \
+  --max-model-len 8192 --gpu-memory-utilization 0.35 \
+  --host 127.0.0.1 --port 8000</pre>
+<p><code>--gpu-memory-utilization 0.35</code> 足够（0.6B 分类头 + 长音频 KV），留余量便于与其它模型共用一张卡。</p>
+
+<h2>5. Smoke 测试</h2>
+<h3>5.1 语音识别</h3>
+<pre>curl http://localhost:8000/v1/audio/transcriptions \
+  -F "file=@data/zh.mp3" -F "model=qwen3-asr-1.7b"
+
+# 中文 → {"text":"開放時間：早上九點至下午五點。","usage":{"type":"duration","seconds":6}}
+# 英文 → {"text":"The tribal chief then called for the boy, and presented him
+#          with fifty pieces of gold.","usage":{"type":"duration","seconds":8}}</pre>
+<p>中英两条均为逐字正确的原文转写（中文样例本身是繁体中文字面，模型输出亦为繁体，未改写）。
+0.6B 版本输出一致，仅英文少一个逗号，属规格差异。</p>
+
+<h3>5.2 强制对齐</h3>
+<pre>python fa_align.py data/en.mp3 "The tribal chief then called for the boy and \
+presented him with fifty pieces of gold." English
+
+{"text": "The",    "start": 1.12, "end": 1.20}
+{"text": "tribal", "start": 1.20, "end": 1.76}
+{"text": "chief",  "start": 1.76, "end": 2.08}
+...
+{"text": "fifty",  "start": 4.96, "end": 5.20}
+{"text": "gold.",  "start": 6.96, "end": 7.04}        # 音频 7.18 s</pre>
+<p>中文（5.62 s 音频，逐字）：<code>開 0.72–0.96 / 放 0.96–1.12 / … / 點 4.80–5.12</code>。
+两条都满足：时间戳严格单调、首尾落在音频时长内、词/字数与文本一致。</p>
+
+<h2>6. 精度测评</h2>
+<div class="warn"><b>本轮未提交精度分数。</b>赛事要求 <code>verify.py</code> 按官方 <code>baselines/&lt;模型&gt;.json</code>
+写死的子集题数、max_tokens、思考开关与官方 GPU 基线分现场跑分；该基线文件与评测子集随分题材料下发，我方未获取到。</div>
+<p>已尝试的获取途径：飞书知识空间返回 <code>131006 permission_denied</code>（节点所属空间未授权）；
+文档搜索「分题材料 / baselines / gsm8k.jsonl」0 命中；实例与共享存储全盘检索无 <code>baselines/</code>、无评测子集。</p>
+<p>按赛事红线（伪造日志取消资格），我们选择留空并写明补齐方式，而不是给出不可复现的数字。
+<code>verify.py</code> 已实现官方判分逻辑（容差 2%、只罚劣化不罚提升、<code>--selfcheck</code> 自检通过），
+拿到官方 <code>baselines/</code> 与 <code>data/</code> 后执行 <code>source env.sh &amp;&amp; python verify.py</code>
+即可产出 <code>verify_result.json</code>。强制对齐的 AAS(ms) 同样需要官方参考输出才能计算。</p>
+
+<h2>7. 性能参考</h2>
+<h3>7.1 语音识别（自定口径，官方 T04 测法随分题材料下发）</h3>
+<p>指标：RTF = 墙钟时间 / 音频时长（越小越好）、吞吐 = audio-s/s。测试集为 3 条公开样例（6 s 中文、8 s 英文、
+6 s 其他），按并发重复提交，全部 HTTP 200。</p>
+<table>
+<tr><th>模型</th><th>并发</th><th>请求数</th><th>墙钟</th><th>音频总长</th><th>RTF</th><th>吞吐</th><th>QPS</th></tr>
+<tr><td rowspan="3">Qwen3-ASR-1.7B</td><td>1</td><td>63</td><td>19.12 s</td><td>420 s</td><td>0.046×</td><td>21.97</td><td>3.30</td></tr>
+<tr><td>8</td><td>48</td><td>2.68 s</td><td>320 s</td><td>0.008×</td><td>119.53</td><td>17.93</td></tr>
+<tr><td>32</td><td>96</td><td>3.07 s</td><td>640 s</td><td>0.005×</td><td>208.23</td><td>31.23</td></tr>
+<tr><td rowspan="3">Qwen3-ASR-0.6B</td><td>1</td><td>63</td><td>11.34 s</td><td>420 s</td><td>0.027×</td><td>37.04</td><td>5.56</td></tr>
+<tr><td>8</td><td>48</td><td>2.51 s</td><td>320 s</td><td>0.008×</td><td>127.26</td><td>19.09</td></tr>
+<tr><td>32</td><td>96</td><td>2.84 s</td><td>640 s</td><td>0.004×</td><td>225.05</td><td>33.76</td></tr>
+</table>
+<p>0.6B 在单并发下比 1.7B 快 1.7 倍，但 32 并发下差距收敛到 8%——说明并发上到 32 后瓶颈不在模型算力侧，
+而在服务链路（HTTP/调度），继续加并发收益有限。</p>
+
+<h3>7.2 强制对齐</h3>
+<table class="kv">
+<tr><td>引擎初始化</td><td>8.74 s（profile + KV cache + warmup，<code>enforce_eager</code>）</td></tr>
+<tr><td>单条 7.18 s 音频 / 16 词，进程冷启动到出结果</td><td>120 s（绝大部分是 Python / torch / vllm 导入）</td></tr>
+<tr><td>稳态推理延迟</td><td>本轮未做重复压测，未测</td></tr>
+</table>
+<p>需要说明：120 s 是<b>进程级冷启动</b>，不是稳态延迟；稳态延迟应在服务常驻后用多次请求取中位数，本轮未做。</p>
+
+<h2>8. 注意事项</h2>
+<ul>
+<li><b><code>-hf</code> 后缀的 ASR 权重不能用</b>：<code>Qwen3-ASR-1.7B-hf</code> 的 707 个张量全部带 <code>model.</code> 前缀，
+vLLM 0.21 加载报 <code>ValueError: There is no module or parameter named 'model'</code>。必须用非 hf 版
+（<code>thinker.</code> 前缀）。这一点会浪费大量排查时间，建议写进官方文档。</li>
+<li><b>三个装配缺一不可</b>：符号链接重指向、补 <code>/opt/hyhal</code>、<code>ROCM_PATH</code> 指向镜像内 DTK。
+第三个最隐蔽——现象是 EngineCore 启动失败，容易误判为「模型不支持」。</li>
+<li><b>纯文本请求不能当文本模型用</b>：ASR 模型收到无音频的文本请求会返回 <code>&lt;asr_text&gt;</code> 类空结果，
+接口可用但语义无意义。</li>
+<li><b>音频必须解码成数组传入</b>：vLLM 的 <code>multi_modal_data={"audio": path}</code> 传字符串会抛
+<code>AssertionError ... got: '/'</code>；且镜像内 <code>torchaudio.load</code> 因缺 <code>torchcodec</code> 不可用，
+用 <code>ffmpeg -f f32le -ac 1 -ar 16000</code> 管道解码最稳。</li>
+<li><b>时间戳掩码要按后缀对齐</b>：音频占位符会在引擎侧展开（本例预测 148 个位置、纯文本 52 个），
+按纯文本 token 数取位置会取错；早期写法能出数但同一句音频起点会从 1.12 s 漂到 2.96 s。</li>
+<li><b>首次启动耗时不是卡死</b>：ASR 约 2–5 分钟（torch.compile）；强制对齐在 <code>enforce_eager</code> 下仅 8.7 s。
+建议用「轮询 /health + 进程存活检查」代替固定 sleep。</li>
+<li>aiter 会提示 <code>NUMA balancing is enabled, which may cause errors</code>，本实例无权限写
+<code>/proc/sys/kernel/numa_balancing</code>，实测未影响结果，保留原样。</li>
+</ul>
+
+<footer>本报告所有数字均来自仓库 <code>evidence/</code> 目录下的原始日志与压测 JSON，可逐条复现。</footer>
+</body>
+</html>
