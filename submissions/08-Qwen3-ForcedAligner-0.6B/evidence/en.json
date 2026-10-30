@@ -1,0 +1,87 @@
+{
+ "audio": "en.mp3",
+ "language": "English",
+ "text": "The tribal chief then called for the boy and presented him with fifty pieces of gold.",
+ "items": [
+  {
+   "text": "The",
+   "start": 1.12,
+   "end": 1.2
+  },
+  {
+   "text": "tribal",
+   "start": 1.2,
+   "end": 1.76
+  },
+  {
+   "text": "chief",
+   "start": 1.76,
+   "end": 2.08
+  },
+  {
+   "text": "then",
+   "start": 2.16,
+   "end": 2.4
+  },
+  {
+   "text": "called",
+   "start": 2.4,
+   "end": 2.72
+  },
+  {
+   "text": "for",
+   "start": 2.72,
+   "end": 2.96
+  },
+  {
+   "text": "the",
+   "start": 2.96,
+   "end": 3.04
+  },
+  {
+   "text": "boy",
+   "start": 3.04,
+   "end": 3.36
+  },
+  {
+   "text": "and",
+   "start": 3.84,
+   "end": 4.0
+  },
+  {
+   "text": "presented",
+   "start": 4.0,
+   "end": 4.56
+  },
+  {
+   "text": "him",
+   "start": 4.56,
+   "end": 4.8
+  },
+  {
+   "text": "with",
+   "start": 4.8,
+   "end": 4.96
+  },
+  {
+   "text": "fifty",
+   "start": 4.96,
+   "end": 5.2
+  },
+  {
+   "text": "pieces",
+   "start": 5.52,
+   "end": 5.92
+  },
+  {
+   "text": "of",
+   "start": 5.92,
+   "end": 6.0
+  },
+  {
+   "text": "gold.",
+   "start": 6.96,
+   "end": 7.04
+  }
+ ]
+}
